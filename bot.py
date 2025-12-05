@@ -1,34 +1,38 @@
-import telebot
-from telebot import types
+import os
 import hashlib
+import logging
 import urllib.parse
-from flask import Flask, request
-import threading
+import asyncio
+from aiohttp import web
+from aiogram import Bot, Dispatcher, types, F
+from aiogram.filters import Command
+from aiogram.types import InlineKeyboardMarkup, InlineKeyboardButton
 
-# --- КОНФИГУРАЦИЯ ---
-BOT_TOKEN = '8074643658:AAHG5ji4KS6c76X0P6Gjhz4t5fzsyXpyEvA'
-MERCHANT_PUBLIC_KEY = '87948-378'
-MERCHANT_SECRET_KEY = '94f0f4c5fa8396533189513d4532e92f'
+# --- НАСТРОЙКИ БЕРЕМ ИЗ ПЕРЕМЕННЫХ ОКРУЖЕНИЯ (Безопасно) ---
+# Если запускаешь локально, можно вписать значения по умолчанию вторым аргументом
+BOT_TOKEN = os.getenv('BOT_TOKEN')
+MERCHANT_PUBLIC_KEY = os.getenv('MERCHANT_PUBLIC_KEY')
+MERCHANT_SECRET_KEY = os.getenv('MERCHANT_SECRET_KEY')
 
-# Настройки для приема уведомлений (Webhook)
-WEBHOOK_HOST = '0.0.0.0'
-WEBHOOK_PORT = 5000
+# URL путь для приема уведомлений
+WEBHOOK_PATH = "/webhook"
 
-bot = telebot.TeleBot(BOT_TOKEN)
-app = Flask(__name__)
+# --- ИНИЦИАЛИЗАЦИЯ ---
+bot = Bot(token=BOT_TOKEN)
+dp = Dispatcher()
+logging.basicConfig(level=logging.INFO)
 
-# --- ФУНКЦИИ ГЕНЕРАЦИИ ССЫЛКИ ---
-def generate_pay4bit_link(user_id, amount_val):
+# --- ГЕНЕРАТОР ССЫЛКИ ---
+def generate_link(user_id, amount_val):
     base_url = "https://api.pay4bit.net/pay"
     account = str(user_id)
     amount_formatted = "{:.2f}".format(amount_val)
-    desc = f"Payment for User {user_id}"
+    desc = f"Order_{user_id}"
     currency = "UAH"
-
-    # Формируем подпись запроса (SHA256)
-    raw_string = desc + account + amount_formatted + MERCHANT_SECRET_KEY
-    sign = hashlib.sha256(raw_string.encode('utf-8')).hexdigest()
-
+    
+    raw = desc + account + amount_formatted + MERCHANT_SECRET_KEY
+    sign = hashlib.sha256(raw.encode()).hexdigest()
+    
     params = {
         'public_key': MERCHANT_PUBLIC_KEY,
         'account': account,
@@ -37,84 +41,67 @@ def generate_pay4bit_link(user_id, amount_val):
         'currency': currency,
         'sign': sign
     }
-    query_string = urllib.parse.urlencode(params)
-    return f"{base_url}?{query_string}"
+    return f"{base_url}?{urllib.parse.urlencode(params)}"
 
-# --- ОБРАБОТЧИК УВЕДОМЛЕНИЙ ОТ PAY4BIT (FLASK) ---
-@app.route('/callback', methods=['POST', 'GET'])
-def payment_callback():
-    # Pay4Bit отправляет данные либо в POST, либо в GET параметрах
-    # Обычно это GET параметры, но проверим оба варианта
-    data = request.args if request.method == 'GET' else request.form
+# --- ОБРАБОТЧИК ОПЛАТЫ (AIOHTTP) ---
+async def pay4bit_handler(request):
+    # Pay4Bit обычно шлет GET параметры
+    data = request.query if request.method == 'GET' else await request.post()
     
-    # Получаем параметры из уведомления
     payment_id = data.get('paymentId')
-    account_id = data.get('account') # Это наш user_id
-    amount = data.get('amount')      # Сумма платежа (может прийти как 'sum' или 'amount')
-    if not amount: amount = data.get('sum')
-    
-    req_sign = data.get('sign')      # Подпись от Pay4Bit для проверки
+    account_id = data.get('account') 
+    amount = data.get('amount') or data.get('sum')
+    req_sign = data.get('sign')
 
-    if not payment_id or not account_id or not req_sign:
-        return "Missing parameters", 400
+    if not all([payment_id, account_id, amount, req_sign]):
+        return web.Response(text="Bad Request", status=400)
 
-    # ПРОВЕРКА ПОДПИСИ (Безопасность)
-    # Согласно документации для Callback используется MD5!
-    # Формула: md5($paymentid.$account.$sum.$merchant_secret_key)
-    raw_check = f"{payment_id}{account_id}{amount}{MERCHANT_SECRET_KEY}"
-    my_sign = hashlib.md5(raw_check.encode('utf-8')).hexdigest()
+    # Проверка подписи (MD5)
+    check_str = f"{payment_id}{account_id}{amount}{MERCHANT_SECRET_KEY}"
+    my_sign = hashlib.md5(check_str.encode()).hexdigest()
 
     if req_sign == my_sign:
-        # --- УСПЕШНАЯ ОПЛАТА ---
-        print(f"✅ Оплата прошла! User: {account_id}, Сумма: {amount}")
-        
         try:
-            # Отправляем сообщение пользователю в Telegram
-            bot.send_message(account_id, f"🎉 Оплата получена!\nСумма: {amount} UAH зачислена на ваш счет.")
-            
-            # ТУТ МОЖНО ДОБАВИТЬ ЛОГИКУ ЗАЧИСЛЕНИЯ В БАЗУ ДАННЫХ
-            # database.add_balance(account_id, amount)
-            
+            await bot.send_message(
+                chat_id=account_id,
+                text=f"✅ Оплата {amount} UAH получена! Спасибо."
+            )
+            return web.Response(text="OK", status=200)
         except Exception as e:
-            print(f"Ошибка отправки сообщения ботом: {e}")
-
-        return "OK", 200
+            logging.error(f"Error sending msg: {e}")
+            return web.Response(text="Bot Error", status=500)
     else:
-        print(f"❌ Ошибка подписи! Пришло: {req_sign}, Ждали: {my_sign}")
-        return "Sign Error", 400
-
-def run_flask():
-    app.run(host=WEBHOOK_HOST, port=WEBHOOK_PORT)
+        return web.Response(text="Sign Error", status=403)
 
 # --- БОТ ---
-@bot.message_handler(commands=['start'])
-def send_welcome(message):
-    markup = types.InlineKeyboardMarkup()
-    pay_btn = types.InlineKeyboardButton("Оплатить 100 грн", callback_data="init_payment")
-    markup.add(pay_btn)
-    bot.reply_to(message, "Тест.", reply_markup=markup)
+@dp.message(Command("start"))
+async def cmd_start(message: types.Message):
+    kb = InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text="Купить за 100 грн", callback_data="buy_100")]
+    ])
+    await message.answer("Бот работает на Render!", reply_markup=kb)
 
-@bot.callback_query_handler(func=lambda call: call.data == "init_payment")
-def handle_payment(call):
-    try:
-        amount = 100.00
-        user_id = call.from_user.id
-        payment_url = generate_pay4bit_link(user_id, amount)
-        
-        markup = types.InlineKeyboardMarkup()
-        url_btn = types.InlineKeyboardButton(f"Оплатить {amount} UAH", url=payment_url)
-        markup.add(url_btn)
-        
-        bot.send_message(call.message.chat.id, f"Сумма на {amount} грн создан.\n.", reply_markup=markup)
-        bot.answer_callback_query(call.id)
-    except Exception as e:
-        bot.send_message(call.message.chat.id, f"Ошибка: {e}")
+@dp.callback_query(F.data == "buy_100")
+async def cb_buy(callback: types.CallbackQuery):
+    url = generate_link(callback.from_user.id, 100.00)
+    kb = InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text="Перейти к оплате", url=url)]
+    ])
+    await callback.message.answer("Ссылка готова:", reply_markup=kb)
+    await callback.answer()
 
-if __name__ == '__main__':
-    # Запускаем Flask сервер в отдельном потоке, чтобы бот не завис
-    flask_thread = threading.Thread(target=run_flask)
-    flask_thread.daemon = True
-    flask_thread.start()
+# --- ФОНОВАЯ ЗАДАЧА ДЛЯ БОТА ---
+async def start_bot_polling(app):
+    # Запускаем поллинг в фоне
+    asyncio.create_task(dp.start_polling(bot))
+
+# --- ЗАПУСК ---
+if __name__ == "__main__":
+    app = web.Application()
+    app.router.add_route('*', WEBHOOK_PATH, pay4bit_handler)
+    app.on_startup.append(start_bot_polling)
     
-    print("Бот и Webhook-сервер запущены...")
-    bot.infinity_polling()
+    # ВАЖНО: Render выдает порт через переменную окружения PORT
+    port = int(os.environ.get("PORT", 8080))
+    
+    web.run_app(app, host="0.0.0.0", port=port)
