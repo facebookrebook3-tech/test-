@@ -81,14 +81,14 @@ async def pay4bit_handler(request):
 @dp.message(Command("start"))
 async def cmd_start(message: types.Message):
     kb = InlineKeyboardMarkup(inline_keyboard=[
-        [InlineKeyboardButton(text="Купить за 10 грн", callback_data="buy_10")]
+        [InlineKeyboardButton(text="Купить за 25 грн", callback_data="buy_25")]
     ])
     await message.answer("Тест", reply_markup=kb)
 
-@dp.callback_query(F.data == "buy_10")
+@dp.callback_query(F.data == "buy_25")
 async def cb_buy(callback: types.CallbackQuery):
     # Генерируем ссылку на 10.00 UAH
-    url = generate_link(callback.from_user.id, 10.00)
+    url = generate_link(callback.from_user.id, 25.00)
     
     kb = InlineKeyboardMarkup(inline_keyboard=[
         [InlineKeyboardButton(text="Перейти к оплате", url=url)]
@@ -109,3 +109,4 @@ if __name__ == "__main__":
     port = int(os.environ.get("PORT", 8080))
     
     web.run_app(app, host="0.0.0.0", port=port)
+
