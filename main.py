@@ -64,7 +64,7 @@ async def pay4bit_handler(request):
         try:
             await bot.send_message(
                 chat_id=account_id,
-                text=f"✅ Оплата {amount} UAH получена! Спасибо."
+                text=f"✅ Оплата {amount} UAH пришло ураа."
             )
             return web.Response(text="OK", status=200)
         except Exception as e:
@@ -77,13 +77,13 @@ async def pay4bit_handler(request):
 @dp.message(Command("start"))
 async def cmd_start(message: types.Message):
     kb = InlineKeyboardMarkup(inline_keyboard=[
-        [InlineKeyboardButton(text="Купить за 100 грн", callback_data="buy_100")]
+        [InlineKeyboardButton(text="Купить за 10 грн", callback_data="buy_100")]
     ])
-    await message.answer("Бот работает на Render!", reply_markup=kb)
+    await message.answer("Праверяем", reply_markup=kb)
 
 @dp.callback_query(F.data == "buy_100")
 async def cb_buy(callback: types.CallbackQuery):
-    url = generate_link(callback.from_user.id, 100.00)
+    url = generate_link(callback.from_user.id, 10.00)
     kb = InlineKeyboardMarkup(inline_keyboard=[
         [InlineKeyboardButton(text="Перейти к оплате", url=url)]
     ])
@@ -105,3 +105,4 @@ if __name__ == "__main__":
     port = int(os.environ.get("PORT", 8080))
     
     web.run_app(app, host="0.0.0.0", port=port)
+
