@@ -4,59 +4,58 @@ import logging
 import urllib.parse
 import asyncio
 from aiohttp import web
+
+# Библиотеки aiogram
 from aiogram import Bot, Dispatcher, types, F
 from aiogram.filters import Command
 from aiogram.types import InlineKeyboardMarkup, InlineKeyboardButton
+from aiogram.fsm.storage.memory import MemoryStorage
+from aiogram.fsm.context import FSMContext
+from aiogram.fsm.state import State, StatesGroup
 
 # --- НАСТРОЙКИ ---
 BOT_TOKEN = os.getenv('BOT_TOKEN')
-MERCHANT_PUBLIC_KEY = os.getenv('MERCHANT_PUBLIC_KEY') # ID проекта (например 378)
+MERCHANT_PUBLIC_KEY = os.getenv('MERCHANT_PUBLIC_KEY')
 MERCHANT_SECRET_KEY = os.getenv('MERCHANT_SECRET_KEY')
 
-# ВАЖНО: Укажите здесь ваш домен на Render без слеша в конце
-# Пример: https://my-app.onrender.com
-WEBHOOK_HOST = os.getenv('RENDER_EXTERNAL_URL') # Render сам создает эту переменную, но проверьте
+# URL вашего приложения на Render
+WEBHOOK_HOST = os.getenv('RENDER_EXTERNAL_URL')
 if not WEBHOOK_HOST:
-    # Если переменной нет, впишите вручную свой домен ниже:
-    WEBHOOK_HOST = "https://ВАШ-ПРОЕКТ.onrender.com"
+    WEBHOOK_HOST = "https://test-u8ew.onrender.com"
 
 WEBHOOK_PATH = "/webhook"
 WEBHOOK_URL = f"{WEBHOOK_HOST}{WEBHOOK_PATH}"
 
 # --- ИНИЦИАЛИЗАЦИЯ ---
 bot = Bot(token=BOT_TOKEN)
-dp = Dispatcher()
-
-# Настройка логирования
+dp = Dispatcher(storage=MemoryStorage())
 logging.basicConfig(level=logging.INFO)
 
-# --- ВСПОМОГАТЕЛЬНЫЕ ФУНКЦИИ ---
+# --- СОСТОЯНИЯ (FSM) ---
+class TopUpState(StatesGroup):
+    waiting_for_currency = State() # Ожидание выбора валюты
+    waiting_for_amount = State()   # Ожидание ввода суммы
 
+# --- ВСПОМОГАТЕЛЬНЫЕ ФУНКЦИИ ---
 def get_param(data, key):
-    """
-    Извлекает значение из данных запроса.
-    Ищет ключ как в чистом виде 'key', так и в формате массива 'params[key]'.
-    """
+    """Извлекает значение ключа из data"""
     if key in data:
         return data[key]
     if f'params[{key}]' in data:
         return data[f'params[{key}]']
     return None
 
-def generate_link(user_id, amount_val):
+def generate_link(user_id, amount_val, currency_code="UAH"):
     """
-    Генерирует ссылку на оплату.
+    Генерирует ссылку на оплату с учетом валюты.
     """
-    base_url = "https://api.pay4bit.net/pay" # Или api.4bill.io (зависит от вашей платежки)
+    base_url = "https://api.pay4bit.net/pay" # Или api.4bill.io
     account = str(user_id)
-    amount_formatted = "{:.2f}".format(amount_val)
-    desc = f"Order_{user_id}"
-    currency = "UAH"
+    # Форматируем сумму всегда с 2 знаками (25 -> 25.00)
+    amount_formatted = "{:.2f}".format(float(amount_val))
+    desc = f"TopUp_{user_id}"
     
-    # Строка для подписи создания ссылки (SHA256)
-    # Формула: account + currency + desc + sum + secret (Порядок важен, сверьте с докой!)
-    # Обычно для 4Bill/Pay4Bit порядок: account + sum + currency + desc + secret? 
-    # В ВАШЕМ СТАРОМ КОДЕ БЫЛО: desc + account + sum + secret. Оставляю как у вас работало.
+    # Подпись
     raw = desc + account + amount_formatted + MERCHANT_SECRET_KEY
     sign = hashlib.sha256(raw.encode()).hexdigest()
     
@@ -65,16 +64,15 @@ def generate_link(user_id, amount_val):
         'account': account,
         'sum': amount_formatted,
         'desc': desc,
-        'currency': currency,
+        'currency': currency_code,
         'sign': sign,
-        'result_url': WEBHOOK_URL # <--- Важно: говорим платежке, куда слать ответ
+        'result_url': WEBHOOK_URL
     }
     return f"{base_url}?{urllib.parse.urlencode(params)}"
 
 # --- ОБРАБОТЧИК ВЕБХУКА (ОПЛАТА) ---
 async def pay4bit_handler(request):
     try:
-        # Получаем данные (поддержка GET и POST/JSON)
         if request.method == 'POST':
             try:
                 data = await request.json()
@@ -85,106 +83,153 @@ async def pay4bit_handler(request):
         
         logging.info(f"Incoming webhook: {data}")
 
-        # Извлекаем данные
         payment_id = get_param(data, 'paymentId') or get_param(data, 'localpayId')
         account_id = get_param(data, 'account')
-        amount = get_param(data, 'amount') or get_param(data, 'sum')
         req_sign = get_param(data, 'sign')
-        method = data.get('method') # check или pay
+        method = data.get('method')
+        
+        currency_in_resp = get_param(data, 'currency') or "UAH"
+        val_sum = get_param(data, 'sum')
+        val_amount = get_param(data, 'amount')
 
-        # Если это просто пинг корневой страницы
         if not payment_id and not account_id:
              return web.Response(text="Bot is running", status=200)
 
-        # Проверка наличия обязательных полей
-        if not all([payment_id, account_id, amount, req_sign]):
-            logging.error("Missing required params in webhook")
-            return web.Response(text="Bad Request: Missing params", status=400)
+        if not all([payment_id, account_id, req_sign]):
+            return web.Response(text="Bad Request", status=400)
 
-        # --- ПРОВЕРКА ПОДПИСИ (MD5) ---
-        # Формируем строку для проверки. Платежка может слать "10" или "10.00".
-        # Проверяем оба варианта, чтобы наверняка.
-        
-        try:
-            # Вариант 1: Как пришло (например "10")
-            raw_str_1 = f"{payment_id}{account_id}{amount}{MERCHANT_SECRET_KEY}"
-            sign_1 = hashlib.md5(raw_str_1.encode()).hexdigest()
+        # --- ПРОВЕРКА ПОДПИСИ ---
+        candidates = []
+        if val_sum: candidates.append(val_sum)
+        if val_amount: candidates.append(val_amount)
+        if val_sum: 
+            try: candidates.append("{:.2f}".format(float(val_sum)))
+            except: pass
+        if val_amount:
+            try:
+                if str(val_amount).endswith('.00'):
+                    candidates.append(str(val_amount)[:-3])
+                else:
+                    candidates.append(str(int(float(val_amount))))
+            except: pass
 
-            # Вариант 2: Принудительно с .00 (например "10.00")
-            amount_float = float(amount)
-            amount_formatted = "{:.2f}".format(amount_float)
-            raw_str_2 = f"{payment_id}{account_id}{amount_formatted}{MERCHANT_SECRET_KEY}"
-            sign_2 = hashlib.md5(raw_str_2.encode()).hexdigest()
-        except Exception as e:
-            logging.error(f"Error calculating hash: {e}")
-            sign_1 = "error"
-            sign_2 = "error"
+        unique_amounts = list(set(candidates))
+        is_valid = False
+        valid_amount_str = "0"
 
-        # Сравниваем пришедшую подпись с нашими вариантами
-        is_valid = (req_sign.lower() == sign_1.lower()) or (req_sign.lower() == sign_2.lower())
+        for amt in unique_amounts:
+            check_str = f"{payment_id}{account_id}{amt}{MERCHANT_SECRET_KEY}"
+            my_sign = hashlib.md5(check_str.encode()).hexdigest()
+            if my_sign.lower() == req_sign.lower():
+                is_valid = True
+                valid_amount_str = amt
+                break
 
         if is_valid:
-            # 1. ОБРАБОТКА 'CHECK'
             if method == 'check':
-                logging.info(f"Check passed for user {account_id}")
                 return web.Response(text="OK", status=200)
 
-            # 2. ОБРАБОТКА 'PAY' (ОПЛАТА)
             elif method == 'pay' or method is None:
-                logging.info(f"Payment success for user {account_id}, amount {amount}")
-
-                # --- ЗАЩИТА ОТ ТЕСТОВЫХ ЗАПРОСОВ ---
                 if str(account_id).lower() == "test":
-                    logging.info("Test payment received. Skipping Telegram notification.")
+                    logging.info("Test payment confirmed.")
                     return web.Response(text="OK", status=200)
-                
+
                 try:
-                    # Уведомляем пользователя
                     await bot.send_message(
                         chat_id=account_id,
-                        text=f"✅ Оплата {amount} UAH прошла успешно!"
+                        text=f"✅ Баланс успешно пополнен на <b>{valid_amount_str} {currency_in_resp}</b>",
+                        parse_mode="HTML"
                     )
-                    
-                    # --- ВЫДАЧА ТОВАРА ---
-                    product_text = "Ета типа ваш тавар пака"
-                    await bot.send_message(chat_id=account_id, text=product_text)
-                    # ---------------------
-                    
                 except Exception as e:
-                    # Логируем ошибку, но платежке отвечаем ОК, так как деньги мы получили
-                    logging.error(f"Failed to send message to user: {e}")
+                    logging.error(f"Telegram error: {e}")
                 
                 return web.Response(text="OK", status=200)
-            
-            else:
-                logging.warning(f"Unknown method: {method}")
-                return web.Response(text="OK", status=200)
-
         else:
-            logging.error(f"Sign mismatch! Req: {req_sign}. Calc1: {sign_1}, Calc2: {sign_2}")
+            logging.error(f"Sign ERROR. Req: {req_sign}. Variants: {unique_amounts}")
             return web.Response(text="Sign Error", status=403)
 
     except Exception as e:
-        logging.error(f"Critical error in webhook handler: {e}")
-        return web.Response(text="Internal Error", status=500)
+        logging.error(f"Handler error: {e}")
+        return web.Response(text="Error", status=500)
 
 # --- ЛОГИКА БОТА ---
-@dp.message(Command("start"))
-async def cmd_start(message: types.Message):
-    kb = InlineKeyboardMarkup(inline_keyboard=[
-        [InlineKeyboardButton(text="Купить за 25 грн", callback_data="buy_25")]
-    ])
-    await message.answer("Добро пожаловать в магазин!", reply_markup=kb)
 
-@dp.callback_query(F.data == "buy_25")
-async def cb_buy(callback: types.CallbackQuery):
-    url = generate_link(callback.from_user.id, 25.00)
+# 1. СТАРТ
+@dp.message(Command("start"))
+async def cmd_start(message: types.Message, state: FSMContext):
+    await state.clear()
     
     kb = InlineKeyboardMarkup(inline_keyboard=[
-        [InlineKeyboardButton(text="Оплатить 25 UAH", url=url)]
+        [
+            InlineKeyboardButton(text="🇺🇦 UAH", callback_data="curr_UAH"),
+            InlineKeyboardButton(text="🇪🇺 EUR", callback_data="curr_EUR")
+        ]
     ])
-    await callback.message.answer("Ссылка для оплаты сформирована:", reply_markup=kb)
-    await callback.answer()
+    
+    await message.answer("Выберите валюту для пополнения:", reply_markup=kb)
+    await state.set_state(TopUpState.waiting_for_currency)
+
+# 2. ВЫБОР ВАЛЮТЫ
+@dp.callback_query(F.data.startswith("curr_"))
+async def process_currency_selection(callback: types.CallbackQuery, state: FSMContext):
+    chosen_currency = callback.data.split("_")[1]
+    
+    await state.update_data(currency=chosen_currency)
+    
+    # Определяем текст минимальной суммы для сообщения
+    min_sum_text = "25" if chosen_currency == "UAH" else "1"
+    
+    await callback.message.edit_text(
+        f"Выбрано: <b>{chosen_currency}</b>.\nТеперь введите сумму пополнения минимум {min_sum_text}:", 
+        parse_mode="HTML"
+    )
+    await state.set_state(TopUpState.waiting_for_amount)
+
+# 3. ВВОД СУММЫ
+@dp.message(TopUpState.waiting_for_amount)
+async def process_amount(message: types.Message, state: FSMContext):
+    user_text = message.text.replace(',', '.')
+    
+    try:
+        amount = float(user_text)
+        
+        # Получаем выбранную валюту
+        data = await state.get_data()
+        currency = data.get('currency', 'UAH')
+        
+        # --- ПРОВЕРКА ЛИМИТОВ ---
+        # Если UAH -> минимум 25, Если EUR -> минимум 1
+        min_limit = 25 if currency == "UAH" else 1
+
+        if amount < min_limit:
+            await message.answer(
+                f"⚠️ Минимальная сумма для {currency} — <b>{min_limit}</b>. Введите сумму снова:", 
+                parse_mode="HTML"
+            )
+            return
+        
+        if amount > 100000:
+            await message.answer("Слишком большая сумма. Введите снова:")
+            return
+
+        # Генерация ссылки
+        pay_url = generate_link(message.from_user.id, amount, currency)
+        
+        kb = InlineKeyboardMarkup(inline_keyboard=[
+            [InlineKeyboardButton(text=f"💳 Оплатить {amount} {currency}", url=pay_url)]
+        ])
+        
+        await message.answer(
+            f"Сума оплаты: <b>{amount} {currency}</b>\n"
+            "Нажмите кнопку ниже для перехода к оплате.",
+            reply_markup=kb,
+            parse_mode="HTML"
+        )
+        
+        await state.clear()
+
+    except ValueError:
+        await message.answer("❌ Это не число. Введите сумму цифрами (например: 50):")
 
 # --- ЗАПУСК ---
 async def start_bot_polling(app):
@@ -195,7 +240,5 @@ if __name__ == "__main__":
     app = web.Application()
     app.router.add_route('*', WEBHOOK_PATH, pay4bit_handler)
     app.on_startup.append(start_bot_polling)
-    
     port = int(os.environ.get("PORT", 8080))
-    logging.info(f"Starting server on port {port}")
     web.run_app(app, host="0.0.0.0", port=port)
